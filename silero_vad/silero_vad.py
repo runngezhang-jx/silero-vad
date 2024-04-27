@@ -34,15 +34,15 @@ class SileroVAD:
         self.sample_rates = [8000, 16000]
 
     def reset_states(self):
-        self._h = np.zeros((2, 1, 64)).astype("float32")
-        self._c = np.zeros((2, 1, 64)).astype("float32")
+        self._h = np.zeros((2, 1, 64)).astype(np.float32)
+        self._c = np.zeros((2, 1, 64)).astype(np.float32)
 
     def __call__(self, x, sr: int):
         ort_inputs = {
             "input": x[np.newaxis, :],
             "h": self._h,
             "c": self._c,
-            "sr": np.array(sr, dtype="int64"),
+            "sr": np.array(sr, dtype=np.int64),
         }
         ort_outs = self.session.run(None, ort_inputs)
         out, self._h, self._c = ort_outs
@@ -136,7 +136,7 @@ class SileroVAD:
 
         wav_path = Path(wav_path)
         original_sr = sf.info(wav_path).samplerate
-        original_wav, _ = sf.read(wav_path, dtype="float32")
+        original_wav, _ = sf.read(wav_path, dtype=np.float32)
         if original_sr in self.sample_rates:
             step = 1.0
             wav, sr = original_wav, original_sr
@@ -299,17 +299,20 @@ class VADIterator:
             warnings.warn(
                 "Unusual window_size_ms! Supported window_size_ms: [32, 64, 96]"
             )
-        self.resampler = None
+        self.step = 1.0
+        self.sampling_rate = sampling_rate
         if sampling_rate not in self.model.sample_rates:
+            self.step = sampling_rate / 16000
             self.resampler = soxr.ResampleStream(
                 sampling_rate, 16000, 1, dtype=np.float32
             )
-            sampling_rate = 16000
+            self.sampling_rate = 16000
+
         self.threshold = threshold
-        self.sampling_rate = sampling_rate
-        self.speech_pad_samples = speech_pad_ms * sampling_rate // 1000
-        self.window_size_samples = window_size_ms * sampling_rate // 1000
-        self.min_silence_samples = sampling_rate * min_silence_duration_ms // 1000
+        self.speech_pad_samples = speech_pad_ms * self.sampling_rate // 1000
+        self.window_size_samples = window_size_ms * self.sampling_rate // 1000
+        self.min_silence_samples = min_silence_duration_ms * self.sampling_rate // 1000
+        self.pad_samples = np.zeros(int(self.speech_pad_samples * self.step))
         self.reset_states()
 
     def reset_states(self):
@@ -317,7 +320,20 @@ class VADIterator:
         self.triggered = False
         self.temp_end = 0
         self.current_sample = 0
+        self.pad_samples.fill(0)
         self.remained_samples = np.empty(0, dtype=np.float32)
+
+    def cache_chunk(self, chunk):
+        # Cache the original chunk for padding
+        self.pad_samples = np.roll(self.pad_samples, -len(chunk))
+        self.pad_samples[-len(chunk) :] = chunk[-len(self.pad_samples) :]
+        # Resampling for the unsupported sample rate
+        if self.resampler:
+            chunk = self.resampler.resample_chunk(chunk)
+        self.remained_samples = np.concatenate((self.remained_samples, chunk), axis=0)
+        while self.remained_samples.shape[0] >= self.window_size_samples:
+            yield self.remained_samples[: self.window_size_samples]
+            self.remained_samples = self.remained_samples[self.window_size_samples :]
 
     def __call__(self, chunk, return_seconds=False):
         """
@@ -327,43 +343,38 @@ class VADIterator:
             whether return timestamps in seconds (default - samples)
         """
 
-        if self.resampler:
-            chunk = self.resampler.resample_chunk(chunk)
-        self.remained_samples = np.concatenate((self.remained_samples, chunk), axis=0)
-        if self.remained_samples.shape[0] < self.window_size_samples:
-            return
+        for chunk in self.cache_chunk(chunk):
+            chunk = self.remained_samples[: self.window_size_samples]
+            self.current_sample += self.window_size_samples
+            speech_prob = self.model(chunk, self.sampling_rate)
+            # Suppress background vocals by harmonic energy
+            # energy = get_energy(x, self.sampling_rate, from_harmonic=4)
+            # if speech_prob < 0.9 and energy < 500 * (1 - speech_prob):
+            #     speech_prob = 0
 
-        chunk = self.remained_samples[: self.window_size_samples]
-        self.remained_samples = self.remained_samples[self.window_size_samples :]
-        self.current_sample += self.window_size_samples
-        speech_prob = self.model(chunk, self.sampling_rate)
-        # Suppress background vocals by harmonic energy
-        # energy = get_energy(x, self.sampling_rate, from_harmonic=4)
-        # if speech_prob < 0.9 and energy < 500 * (1 - speech_prob):
-        #     speech_prob = 0
-
-        if speech_prob >= self.threshold:
-            self.temp_end = 0
-            # triggered = True means the speech has been started
-            if not self.triggered:
-                self.triggered = True
-                speech_start = (
-                    self.current_sample
-                    - self.window_size_samples
-                    - self.speech_pad_samples
-                )
-                if return_seconds:
-                    speech_start = round(speech_start / self.sampling_rate, 3)
-                return {"start": speech_start}
-
-        if speech_prob < self.threshold - 0.15 and self.triggered:
-            if not self.temp_end:
-                self.temp_end = self.current_sample
-            if self.current_sample - self.temp_end >= self.min_silence_samples:
-                speech_end = self.temp_end + self.speech_pad_samples
-                if return_seconds:
-                    speech_end = round(speech_end / self.sampling_rate, 3)
+            if speech_prob >= self.threshold:
                 self.temp_end = 0
-                self.triggered = False
-                return {"end": speech_end}
-        return
+                # triggered = True means the speech has been started
+                if not self.triggered:
+                    self.triggered = True
+                    speech_start = (
+                        self.current_sample
+                        - self.window_size_samples
+                        - self.speech_pad_samples
+                    )
+                    if return_seconds:
+                        speech_start = round(speech_start / self.sampling_rate, 3)
+                    yield {"start": speech_start}, self.pad_samples
+            elif speech_prob < self.threshold - 0.15 and self.triggered:
+                if not self.temp_end:
+                    self.temp_end = self.current_sample
+                if self.current_sample - self.temp_end >= self.min_silence_samples:
+                    speech_end = self.temp_end + self.speech_pad_samples
+                    if return_seconds:
+                        speech_end = round(speech_end / self.sampling_rate, 3)
+                    self.temp_end = 0
+                    self.triggered = False
+                    yield {"end": speech_end}, None
+
+            # if self.triggered:
+            #     yield None, self.

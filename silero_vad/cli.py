@@ -15,7 +15,6 @@
 import click
 import numpy as np
 import soundfile as sf
-import soxr
 
 from silero_vad import SileroVAD, VADIterator
 
@@ -37,9 +36,9 @@ def main(wav_path: str, streaming: bool):
 
         for i in range(0, len(wav), window_size_samples):
             chunk = wav[i : i + window_size_samples]
-            speech_dict = vad_iterator(chunk, return_seconds=True)
-            if speech_dict:
-                print(speech_dict, end=" ")
+            for speech_dict, speech_samples in vad_iterator(chunk, return_seconds=True):
+                if speech_dict:
+                    print(speech_dict, end=" ")
         # reset model states after each audio
         vad_iterator.reset_states()
 
